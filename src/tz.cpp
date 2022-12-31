@@ -848,7 +848,8 @@ load_timezone_mappings_from_memory_xml_file(const std::string& input_path)
     std::vector<detail::timezone_mapping> mappings;
     std::string line;
 
-    std::istringstream is(xml_file.buf, xml_file.length);
+    std::string xml(xml_file.buf, xml_file.length);
+    std::istringstream is(xml);
 
     auto error = [&input_path, &line_num](const char* info)
     {
@@ -3790,7 +3791,8 @@ init_tzdb()
 
             for (auto& filename : memory_files)
             {
-                std::istringstream infile(filename.buf, filename.length);
+                std::string _in(filename.buf, filename.length);
+                std::istringstream infile(_in);
                 while (infile)
                 {
                     std::getline(infile, line);
@@ -3898,7 +3900,9 @@ init_tzdb()
                 }
             }
         }
+#if !AUTO_DOWNLOAD
     }
+#endif
     std::sort(db->rules.begin(), db->rules.end());
     Rule::split_overlaps(db->rules);
     std::sort(db->zones.begin(), db->zones.end());
