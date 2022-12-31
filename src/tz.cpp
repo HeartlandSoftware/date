@@ -102,6 +102,7 @@
 #include <cwchar>
 #include <exception>
 #include <fstream>
+#include <sstream>
 #include <iostream>
 #include <iterator>
 #include <memory>
@@ -420,6 +421,41 @@ set_install(const std::string& install)
     access_install() = install;
 }
 
+struct memory_file {
+    memory_file()                       { buf = nullptr; length = 0; }
+    memory_file(const memory_file &mf)  { buf = (char *)malloc(mf.length); memcpy(buf, mf.buf, mf.length); length = mf.length; }
+    memory_file(memory_file&& mf)       { buf = mf.buf; mf.buf = nullptr; length = mf.length; }
+    ~memory_file()                      { if (buf) free(buf); }
+
+    char* buf;
+    std::uint64_t length;
+};
+static std::vector<memory_file> memory_files;
+static memory_file xml_file;
+static std::string memory_files_version;
+
+void
+add_inmemory_file(const unsigned char* buf, const std::uint64_t length) {
+    memory_file mf;
+    mf.buf = (char *)malloc(length);
+    memcpy(mf.buf, buf, length);
+    mf.length = length;
+    memory_files.push_back(mf);
+}
+
+void
+version_inmemory_file(const std::string& version)
+{
+    memory_files_version = version;
+}
+
+void
+xml_inmemory_file(const unsigned char* buf, const std::uint64_t length) {
+    xml_file.buf = (char*)malloc(length);
+    memcpy(xml_file.buf, buf, length);
+    xml_file.length = length;
+}
+
 static
 const std::string&
 get_install()
@@ -633,9 +669,8 @@ sort_zone_mappings(std::vector<date::detail::timezone_mapping>& mappings)
     });
 }
 
-static
 bool
-native_to_standard_timezone_name(const std::string& native_tz_name,
+tzdb::native_to_standard_timezone_name(const std::string& native_tz_name,
                                  std::string& standard_tz_name)
 {
     // TOOD! Need be a case insensitive compare?
@@ -799,6 +834,147 @@ load_timezone_mappings_from_xml_file(const std::string& input_path)
             if (commentPos == std::string::npos)
                 error("Unexpected mapping record found. A xml mapZone or comment "
                       "attribute or mapTimezones closing tag was expected.");
+        }
+    }
+
+    return mappings;
+}
+
+static
+std::vector<detail::timezone_mapping>
+load_timezone_mappings_from_memory_xml_file(const std::string& input_path)
+{
+    std::size_t line_num = 0;
+    std::vector<detail::timezone_mapping> mappings;
+    std::string line;
+
+    std::istringstream is(xml_file.buf, xml_file.length);
+
+    auto error = [&input_path, &line_num](const char* info)
+    {
+        std::string msg = "Error loading time zone mapping file \"";
+        msg += input_path;
+        msg += "\" at line ";
+        msg += std::to_string(line_num);
+        msg += ": ";
+        msg += info;
+        throw std::runtime_error(msg);
+    };
+    // [optional space]a="b"
+    auto read_attribute = [&line, &error]
+    (const char* name, std::string& value, std::size_t startPos)
+        ->std::size_t
+    {
+        value.clear();
+        // Skip leading space before attribute name.
+        std::size_t spos = line.find_first_not_of(' ', startPos);
+        if (spos == std::string::npos)
+            spos = startPos;
+        // Assume everything up to next = is the attribute name
+        // and that an = will always delimit that.
+        std::size_t epos = line.find('=', spos);
+        if (epos == std::string::npos)
+            error("Expected \'=\' right after attribute name.");
+        std::size_t name_len = epos - spos;
+        // Expect the name we find matches the name we expect.
+        if (line.compare(spos, name_len, name) != 0)
+        {
+            std::string msg;
+            msg = "Expected attribute name \'";
+            msg += name;
+            msg += "\' around position ";
+            msg += std::to_string(spos);
+            msg += " but found something else.";
+            error(msg.c_str());
+        }
+        ++epos; // Skip the '=' that is after the attribute name.
+        spos = epos;
+        if (spos < line.length() && line[spos] == '\"')
+            ++spos; // Skip the quote that is before the attribute value.
+        else
+        {
+            std::string msg = "Expected '\"' to begin value of attribute \'";
+            msg += name;
+            msg += "\'.";
+            error(msg.c_str());
+        }
+        epos = line.find('\"', spos);
+        if (epos == std::string::npos)
+        {
+            std::string msg = "Expected '\"' to end value of attribute \'";
+            msg += name;
+            msg += "\'.";
+            error(msg.c_str());
+        }
+        // Extract everything in between the quotes. Note no escaping is done.
+        std::size_t value_len = epos - spos;
+        value.assign(line, spos, value_len);
+        ++epos; // Skip the quote that is after the attribute value;
+        return epos;
+    };
+
+    // Quick but not overly forgiving XML mapping file processing.
+    bool mapTimezonesOpenTagFound = false;
+    bool mapTimezonesCloseTagFound = false;
+    std::size_t mapZonePos = std::string::npos;
+    std::size_t mapTimezonesPos = std::string::npos;
+    CONSTDATA char mapTimeZonesOpeningTag[] = { "<mapTimezones " };
+    CONSTDATA char mapZoneOpeningTag[] = { "<mapZone " };
+    CONSTDATA std::size_t mapZoneOpeningTagLen = sizeof(mapZoneOpeningTag) /
+        sizeof(mapZoneOpeningTag[0]) - 1;
+    while (!mapTimezonesOpenTagFound)
+    {
+        std::getline(is, line);
+        ++line_num;
+        if (is.eof())
+        {
+            // If there is no mapTimezones tag is it an error?
+            // Perhaps if there are no mapZone mappings it might be ok for
+            // its parent mapTimezones element to be missing?
+            // We treat this as an error though on the assumption that if there
+            // really are no mappings we should still get a mapTimezones parent
+            // element but no mapZone elements inside. Assuming we must
+            // find something will hopefully at least catch more drastic formatting
+            // changes or errors than if we don't do this and assume nothing found.
+            error("Expected a mapTimezones opening tag.");
+        }
+        mapTimezonesPos = line.find(mapTimeZonesOpeningTag);
+        mapTimezonesOpenTagFound = (mapTimezonesPos != std::string::npos);
+    }
+
+    // NOTE: We could extract the version info that follows the opening
+    // mapTimezones tag and compare that to the version of other data we have.
+    // I would have expected them to be kept in synch but testing has shown
+    // it typically does not match anyway. So what's the point?
+    while (!mapTimezonesCloseTagFound)
+    {
+        std::ws(is);
+        std::getline(is, line);
+        ++line_num;
+        if (is.eof())
+            error("Expected a mapTimezones closing tag.");
+        if (line.empty())
+            continue;
+        mapZonePos = line.find(mapZoneOpeningTag);
+        if (mapZonePos != std::string::npos)
+        {
+            mapZonePos += mapZoneOpeningTagLen;
+            detail::timezone_mapping zm{};
+            std::size_t pos = read_attribute("other", zm.other, mapZonePos);
+            pos = read_attribute("territory", zm.territory, pos);
+            read_attribute("type", zm.type, pos);
+            mappings.push_back(std::move(zm));
+
+            continue;
+        }
+        mapTimezonesPos = line.find("</mapTimezones>");
+        mapTimezonesCloseTagFound = (mapTimezonesPos != std::string::npos);
+        if (!mapTimezonesCloseTagFound)
+        {
+            std::size_t commentPos = line.find("<!--");
+            if (commentPos == std::string::npos)
+                error("Unexpected mapping record found. A xml mapZone or comment "
+                    "attribute or mapTimezones closing tag was expected.");
         }
     }
 
@@ -3561,7 +3737,7 @@ init_tzdb()
     const std::string install = get_install();
     const std::string path = install + folder_delimiter;
     std::string line;
-    bool continue_zone = false;
+    bool continue_zone = false, loaded = false;
     std::unique_ptr<tzdb> db(new tzdb);
 
 #if AUTO_DOWNLOAD
@@ -3608,65 +3784,117 @@ init_tzdb()
         std::string msg = "Timezone database not found at \"";
         msg += install;
         msg += "\"";
-        throw std::runtime_error(msg);
+
+        if (!memory_files.empty()) {
+            db->version = memory_files_version;
+
+            for (auto& filename : memory_files)
+            {
+                std::istringstream infile(filename.buf, filename.length);
+                while (infile)
+                {
+                    std::getline(infile, line);
+                    if (!line.empty() && line[0] != '#')
+                    {
+                        std::istringstream in(line);
+                        std::string word;
+                        in >> word;
+                        if (word == "Rule")
+                        {
+                            db->rules.push_back(Rule(line));
+                            continue_zone = false;
+                        }
+                        else if (word == "Link")
+                        {
+                            db->links.push_back(time_zone_link(line));
+                            continue_zone = false;
+                        }
+                        else if (word == "Leap")
+                        {
+                            db->leap_seconds.push_back(leap_second(line, detail::undocumented{}));
+                            continue_zone = false;
+                        }
+                        else if (word == "Zone")
+                        {
+                            db->zones.push_back(time_zone(line, detail::undocumented{}));
+                            continue_zone = true;
+                        }
+                        else if (line[0] == '\t' && continue_zone)
+                        {
+                            db->zones.back().add(line);
+                        }
+                        else
+                        {
+//                            std::cerr << line << '\n';        // the current TZ files that we are loading have some lines that are dumped out here, so we'll suppress that (for now)
+                        }
+                    }
+                }
+                free(filename.buf);
+                filename.buf = nullptr;
+            }
+            loaded = true;
+        } else
+            throw std::runtime_error(msg);
     }
-    db->version = get_version(path);
+    if (!loaded) {
+        db->version = get_version(path);
 #endif  // !AUTO_DOWNLOAD
 
-    CONSTDATA char*const files[] =
-    {
-        "africa", "antarctica", "asia", "australasia", "backward", "etcetera", "europe",
-        "pacificnew", "northamerica", "southamerica", "systemv", "leapseconds"
-    };
+        CONSTDATA char* const files[] =
+        {
+            "africa", "antarctica", "asia", "australasia", "backward", "etcetera", "europe",
+            "pacificnew", "northamerica", "southamerica", "systemv", "leapseconds"
+        };
 
-    for (const auto& filename : files)
-    {
-        std::string file_path = path + filename;
-        if (!file_exists(file_path))
+        for (const auto& filename : files)
         {
-          continue;
-        }
-        file_streambuf inbuf(file_path);
-        std::istream infile(&inbuf);
-        while (infile)
-        {
-            std::getline(infile, line);
-            if (!line.empty() && line[0] != '#')
+            std::string file_path = path + filename;
+            if (!file_exists(file_path))
             {
-                std::istringstream in(line);
-                std::string word;
-                in >> word;
-                if (word == "Rule")
+                continue;
+            }
+            file_streambuf inbuf(file_path);
+            std::istream infile(&inbuf);
+            while (infile)
+            {
+                std::getline(infile, line);
+                if (!line.empty() && line[0] != '#')
                 {
-                    db->rules.push_back(Rule(line));
-                    continue_zone = false;
-                }
-                else if (word == "Link")
-                {
-                    db->links.push_back(time_zone_link(line));
-                    continue_zone = false;
-                }
-                else if (word == "Leap")
-                {
-                    db->leap_seconds.push_back(leap_second(line, detail::undocumented{}));
-                    continue_zone = false;
-                }
-                else if (word == "Zone")
-                {
-                    db->zones.push_back(time_zone(line, detail::undocumented{}));
-                    continue_zone = true;
-                }
-                else if (line[0] == '\t' && continue_zone)
-                {
-                    db->zones.back().add(line);
-                }
+                    std::istringstream in(line);
+                    std::string word;
+                    in >> word;
+                    if (word == "Rule")
+                    {
+                        db->rules.push_back(Rule(line));
+                        continue_zone = false;
+                    }
+                    else if (word == "Link")
+                    {
+                        db->links.push_back(time_zone_link(line));
+                        continue_zone = false;
+                    }
+                    else if (word == "Leap")
+                    {
+                        db->leap_seconds.push_back(leap_second(line, detail::undocumented{}));
+                        continue_zone = false;
+                    }
+                    else if (word == "Zone")
+                    {
+                        db->zones.push_back(time_zone(line, detail::undocumented{}));
+                        continue_zone = true;
+                    }
+                    else if (line[0] == '\t' && continue_zone)
+                    {
+                        db->zones.back().add(line);
+                    }
                 else if (word.size() > 0 && word[0] == '#')
                 {
                     continue;
                 }
-                else
-                {
-                    std::cerr << line << '\n';
+                    else
+                    {
+                        std::cerr << line << '\n';
+                    }
                 }
             }
         }
@@ -3682,7 +3910,10 @@ init_tzdb()
 
 #ifdef _WIN32
     std::string mapping_file = get_install() + folder_delimiter + "windowsZones.xml";
-    db->mappings = load_timezone_mappings_from_xml_file(mapping_file);
+    if (file_exists(mapping_file))
+        db->mappings = load_timezone_mappings_from_xml_file(mapping_file);
+    else
+        db->mappings = load_timezone_mappings_from_memory_xml_file(mapping_file);
     sort_zone_mappings(db->mappings);
 #endif // _WIN32
 
@@ -3748,7 +3979,8 @@ tzdb::locate_zone(const std::string& tz_name) const
                 return &*zi;
         }
 #endif  // !USE_OS_TZDB
-        throw std::runtime_error(std::string(tz_name) + " not found in timezone database");
+//        throw std::runtime_error(std::string(tz_name) + " not found in timezone database");
+        return nullptr;
     }
     return &*zi;
 }

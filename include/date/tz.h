@@ -1195,6 +1195,8 @@ struct tzdb
     const time_zone* locate_zone(const std::string& tz_name) const;
 #endif
     const time_zone* current_zone() const;
+
+    static bool native_to_standard_timezone_name(const std::string& native_tz_name, std::string& standard_tz_name);
 };
 
 using TZ_DB = tzdb;
@@ -1298,6 +1300,9 @@ DATE_API tzdb_list& get_tzdb_list();
 
 DATE_API const tzdb& reload_tzdb();
 DATE_API void        set_install(const std::string& install);
+DATE_API void        add_inmemory_file(const unsigned char* buf, const std::uint64_t length);
+DATE_API void        xml_inmemory_file(const unsigned char* buf, const std::uint64_t length);
+DATE_API void        version_inmemory_file(const std::string& version);
 
 #endif  // !USE_OS_TZDB
 
